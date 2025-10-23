@@ -1,4 +1,4 @@
-/*
+﻿/*
 ===========================================================================
 Copyright (C) 1999-2005 Id Software, Inc.
 
@@ -393,6 +393,9 @@ void RB_BeginDrawingView (void) {
 
 	// we will only draw a sun if there was sky rendered in this view
 	backEnd.skyRenderedThisView = qfalse;
+
+	// cache the clamped greyscale value
+	backEnd.greyscale = Com_Clamp(0.0f, 1.0f, r_greyscale->value);
 
 	// clip to the plane of the portal
 	if ( backEnd.viewParms.isPortal ) {
@@ -1357,6 +1360,86 @@ const void *RB_ClearDepth(const void *data)
 	return (const void *)(cmd + 1);
 }
 
+/*
+=============
+RB_DrawGreyscale
+
+=============
+*/
+
+static void RB_DrawGreyscale(const FBO_t* src)
+{
+	if (!src || !src->colorImage[0])
+		return;
+
+	FBO_Bind(NULL);
+	qglViewport(0, 0, glConfig.vidWidth, glConfig.vidHeight);
+	qglScissor(0, 0, glConfig.vidWidth, glConfig.vidHeight);
+	GL_State(GLS_DEPTHTEST_DISABLE | GLS_SRCBLEND_ONE | GLS_DSTBLEND_ZERO);
+
+	GLSL_BindProgram(&tr.greyscaleShader);
+	GLSL_SetUniformInt(&tr.greyscaleShader, UNIFORM_TEXTUREMAP, 0);
+	GLSL_SetUniformFloat(&tr.greyscaleShader, UNIFORM_GREYSCALE, backEnd.greyscale);
+	GL_BindToTMU(src->colorImage[0], 0);
+
+	vec4_t quadVerts[4] = {
+		{ 0.0f,                      0.0f,                       0.0f, 1.0f },
+		{ (float)glConfig.vidWidth,  0.0f,                       0.0f, 1.0f },
+		{ (float)glConfig.vidWidth,  (float)glConfig.vidHeight,  0.0f, 1.0f },
+		{ 0.0f,                      (float)glConfig.vidHeight,  0.0f, 1.0f },
+	};
+
+	vec2_t texCoords[4] = { {0.0f, 1.0f}, {1.0f, 1.0f}, {1.0f, 0.0f}, {0.0f, 0.0f} };
+
+	RB_InstantQuad2(quadVerts, texCoords);
+}
+
+/*
+=============
+RB_PresentToScreen
+
+=============
+*/
+
+static void RB_PresentToScreen(void)
+{
+	if (!glRefConfig.framebufferObject)
+		return;
+
+	const FBO_t* src = NULL;
+
+	if (tr.renderFbo && tr.renderFbo->colorImage[0])
+	{
+		// texture-backed render FBO
+		src = tr.renderFbo;
+	}
+	else if (tr.msaaResolveFbo && r_hdr->integer)
+	{
+		// Resolving an RGB16F MSAA FBO to the screen messes with the brightness, so resolve to an RGB16F FBO first
+		FBO_FastBlit(tr.renderFbo, NULL, tr.msaaResolveFbo, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		src = tr.msaaResolveFbo;
+	}
+
+	if (src)
+	{
+		if (backEnd.greyscale > 0.0f)
+		{
+			RB_DrawGreyscale(src);
+		}
+		else
+		{
+			FBO_FastBlit(src, NULL, NULL, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+		}
+		return;
+	}
+
+	if (tr.renderFbo)
+	{
+		FBO_FastBlit(tr.renderFbo, NULL, NULL, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
+	}
+}
+
+
 
 /*
 =============
@@ -1364,65 +1447,55 @@ RB_SwapBuffers
 
 =============
 */
-const void	*RB_SwapBuffers( const void *data ) {
-	const swapBuffersCommand_t	*cmd;
+
+const void *RB_SwapBuffers(const void* data) {
+	const swapBuffersCommand_t* cmd;
 
 	// finish any 2D drawing if needed
-	if ( tess.numIndexes ) {
+	if (tess.numIndexes) {
 		RB_EndSurface();
 	}
 
 	// texture swapping test
-	if ( r_showImages->integer ) {
+	if (r_showImages->integer) {
 		RB_ShowImages();
 	}
 
-	cmd = (const swapBuffersCommand_t *)data;
+	cmd = (const swapBuffersCommand_t*)data;
 
 	// we measure overdraw by reading back the stencil buffer and
 	// counting up the number of increments that have happened
-	if ( r_measureOverdraw->integer ) {
+	if (r_measureOverdraw->integer) {
 		int i;
 		long sum = 0;
-		unsigned char *stencilReadback;
+		unsigned char* stencilReadback;
 
-		stencilReadback = ri.Hunk_AllocateTempMemory( glConfig.vidWidth * glConfig.vidHeight );
-		qglReadPixels( 0, 0, glConfig.vidWidth, glConfig.vidHeight, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, stencilReadback );
+		stencilReadback = ri.Hunk_AllocateTempMemory(glConfig.vidWidth * glConfig.vidHeight);
+		qglReadPixels(0, 0, glConfig.vidWidth, glConfig.vidHeight, GL_STENCIL_INDEX, GL_UNSIGNED_BYTE, stencilReadback);
 
-		for ( i = 0; i < glConfig.vidWidth * glConfig.vidHeight; i++ ) {
+		for (i = 0; i < glConfig.vidWidth * glConfig.vidHeight; i++) {
 			sum += stencilReadback[i];
 		}
 
 		backEnd.pc.c_overDraw += sum;
-		ri.Hunk_FreeTempMemory( stencilReadback );
+		ri.Hunk_FreeTempMemory(stencilReadback);
 	}
 
-	if (glRefConfig.framebufferObject)
-	{
-		if (tr.msaaResolveFbo && r_hdr->integer)
-		{
-			// Resolving an RGB16F MSAA FBO to the screen messes with the brightness, so resolve to an RGB16F FBO first
-			FBO_FastBlit(tr.renderFbo, NULL, tr.msaaResolveFbo, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-			FBO_FastBlit(tr.msaaResolveFbo, NULL, NULL, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		}
-		else if (tr.renderFbo)
-		{
-			FBO_FastBlit(tr.renderFbo, NULL, NULL, NULL, GL_COLOR_BUFFER_BIT, GL_NEAREST);
-		}
-	}
+	RB_PresentToScreen();
 
-	if ( !glState.finishCalled ) {
+	if (!glState.finishCalled) {
 		qglFinish();
 	}
 
-	GLimp_LogComment( "***************** RB_SwapBuffers *****************\n\n\n" );
+	GLimp_LogComment("***************** RB_SwapBuffers *****************\n\n\n");
 
 	GLimp_EndFrame();
 
 	backEnd.projection2D = qfalse;
 
-	return (const void *)(cmd + 1);
+	return (const void*)(cmd + 1);
 }
+
 
 /*
 =============
